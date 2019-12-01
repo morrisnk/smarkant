@@ -10,10 +10,8 @@
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
 #include <Wire.h>
-#include <AWSWebSocketClient.h>
-#include <IPStack.h>
-#include <Countdown.h>
-#include <MQTTClient.h>
+#include <WifiClient.h>
+#include <PubSubClient.h>
 #include "config.h"
 
 const int PIN_STATUS_LED = 2;
@@ -23,7 +21,7 @@ const uint16_t HEIGHT_MAX = 6000;
 const uint16_t HEIGHT_MIN = 500;
 const unsigned long WAIT_FOR_I2C_BYTES_TIMEOUT_MS = 1000;
 const uint8_t I2C_ADDRESS = 0x10;
-const int WEBSOCKET_PORT = 443;
+const int WEBSOCKET_PORT = 1883;
 const int WEBSOCKET_BUFFER_SIZE = 1000;
 const int MQTT_MAX_PACKAGE_SIZE = 512;
 const int MQTT_MAX_MESSAGE_HANDLERS = 1;
@@ -47,9 +45,8 @@ enum I2CCommand {
 
 MDNSResponder mdns;
 ESP8266WebServer server(80);
-AWSWebSocketClient awsIotClient(WEBSOCKET_BUFFER_SIZE);
-IPStack mqttIpStack(awsIotClient);
-MQTT::Client<IPStack, Countdown, MQTT_MAX_PACKAGE_SIZE, MQTT_MAX_MESSAGE_HANDLERS> *mqttClient = NULL;
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
 
 void log(const char *str, ...);
 void logProgress();
@@ -58,12 +55,12 @@ void setup();
 void setupWiFi();
 void setupOTA();
 void setupWebServer();
-void setupAwsIot();
+void setupMqtt();
 void loop();
 bool waitForI2CBytesAvailable(int waitForNumBytess);
-bool awsIotConnect ();
-void awsIotSubscribeToShadowUpdates();
-void awsIotMessageReceived(MQTT::MessageData& message);
+void mqttConnect ();
+void mqttSubscribeToShadowUpdates();
+void mqttMessageReceived(char* topic, byte* payload, unsigned int length);
 void tableStop();
 void tableMoveUp();
 void tableMoveDown();
@@ -79,7 +76,7 @@ void setup() {
   setupWiFi();
   setupOTA();
   setupWebServer();
-  setupAwsIot();
+  setupMqtt();
 }
 
 void setupWiFi() {
@@ -126,12 +123,10 @@ void setupOTA() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
-  if (awsIotClient.connected ()) {
-     mqttClient->yield(MQTT_YIELD_TIMEOUT_MS);
+  if (!client.connected ()) {
+    mqttConnect();
   } else {
-    if (awsIotConnect()){
-      awsIotSubscribeToShadowUpdates();
-    }
+    client.loop();
   }
 }
 
@@ -144,14 +139,13 @@ void setupWebServer() {
     Wire.beginTransmission(I2C_ADDRESS);
     Wire.write(I2C_CMD_READ_HEIGHT);
     Wire.endTransmission();
-    Wire.requestFrom(I2C_ADDRESS, 2);
+    Wire.requestFrom(I2C_ADDRESS, (uint8_t)2);
     if (waitForI2CBytesAvailable(2)) {
       uint16_t height = Wire.read() + (Wire.read() << 8);
-      StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-      JsonObject &json = jsonBuffer.createObject();
+      StaticJsonDocument<JSON_BUFFER_LENGTH> json;
       json["value"] = height;
       String responseString;
-      json.printTo(responseString);
+      serializeJson(json, responseString);
       server.send(200, "application/json", responseString);
     } else {
       server.send(500);
@@ -159,9 +153,12 @@ void setupWebServer() {
   });
 
   server.on("/move", HTTP_PUT, [](){
-    StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-    JsonObject &json = jsonBuffer.parseObject(server.arg("plain"));
-    if (json.success()) {
+    StaticJsonDocument<JSON_BUFFER_LENGTH> jsonBuffer;
+    DeserializationError error = deserializeJson(jsonBuffer, server.arg("plain"));
+    if (error) {
+      server.send(400);
+    } else {
+      JsonObject json = jsonBuffer.as<JsonObject>();
       if (json.containsKey("height")) {
         tableMoveToHeight((int) json["height"]);
       }
@@ -169,31 +166,31 @@ void setupWebServer() {
         tableMoveToPosition((int) json["position"]);
       }
       server.send(204);
-    } else {
-      server.send(400);
     }
   });
 
   server.on("/config", HTTP_GET, [](){
-    StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-    JsonObject &json = jsonBuffer.createObject();
+    StaticJsonDocument<JSON_BUFFER_LENGTH> json;
     Wire.beginTransmission(I2C_ADDRESS);
     Wire.write(I2C_CMD_READ_HEIGHT_THRESHOLD);
     Wire.endTransmission();
-    Wire.requestFrom(I2C_ADDRESS, 2);
+    Wire.requestFrom(I2C_ADDRESS, (uint8_t)2);
     if (waitForI2CBytesAvailable(2)) {
       uint16_t threshold = Wire.read() + (Wire.read() << 8);
       json["threshold"] = threshold;
     }
     String responseString;
-    json.printTo(responseString);
+    serializeJson(json, responseString);
     server.send(200, "application/json", responseString);
   });
 
   server.on("/config", HTTP_PUT, [](){
-    StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-    JsonObject &json = jsonBuffer.parseObject(server.arg("plain"));
-    if (json.success()) {
+    StaticJsonDocument<JSON_BUFFER_LENGTH> jsonBuffer;
+    DeserializationError error = deserializeJson(jsonBuffer, server.arg("plain"));
+    if (error) {
+      server.send(400);
+    } else {
+      JsonObject json = jsonBuffer.as<JsonObject>();
       if (json.containsKey("threshold")) {
         int threshold = json["threshold"];
         uint8_t data[] = {I2C_CMD_STORE_THRESHOLD, (uint8_t) (threshold & 0xff), (uint8_t) (threshold >> 8)};
@@ -202,8 +199,6 @@ void setupWebServer() {
         Wire.endTransmission();
       }
       server.send(204);
-    } else {
-      server.send(400);
     }
   });
 
@@ -226,10 +221,9 @@ void setupWebServer() {
     Wire.beginTransmission(I2C_ADDRESS);
     Wire.write(I2C_CMD_READ_POSITIONS);
     Wire.endTransmission();
-    Wire.requestFrom(I2C_ADDRESS, 2 * NUM_POSITION_BUTTONS);
+    Wire.requestFrom(I2C_ADDRESS, (uint8_t)(2 * NUM_POSITION_BUTTONS));
     if (waitForI2CBytesAvailable(2)) {
-      StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-      JsonObject &json = jsonBuffer.createObject();
+      StaticJsonDocument<JSON_BUFFER_LENGTH> json;
       uint16_t position = Wire.read() + (Wire.read() << 8);
       json["position0"] = position;
       position = Wire.read() + (Wire.read() << 8);
@@ -239,7 +233,7 @@ void setupWebServer() {
       position = Wire.read() + (Wire.read() << 8);
       json["position3"] = position;
       String responseString;
-      json.printTo(responseString);
+      serializeJson(json, responseString);
       server.send(200, "application/json", responseString);
     } else {
       server.send(500);
@@ -247,39 +241,32 @@ void setupWebServer() {
   });
 
   server.on("/positions", HTTP_PUT, [](){
-    StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-    JsonObject &json = jsonBuffer.parseObject(server.arg("plain"));
-    if (json.success()) {
-      char * attrName = "positionX";
+    StaticJsonDocument<JSON_BUFFER_LENGTH> jsonBuffer;
+    DeserializationError error = deserializeJson(jsonBuffer, server.arg("plain"));
+    if (error) {
+      server.send(400);
+    } else {
+      JsonObject json = jsonBuffer.as<JsonObject>();
+      char * attrName = (char*)"positionX";
       for (int i = 0; i < NUM_POSITION_BUTTONS; ++i) {
         sprintf(attrName, "position%1d", i);
         if (json.containsKey(attrName)) {
           int position = json[attrName];
-          uint8_t data[] = {I2C_CMD_STORE_POSITION, i, (uint8_t) (position & 0xff), (uint8_t) (position >> 8)};
+          uint8_t data[] = {I2C_CMD_STORE_POSITION, (uint8_t)i, (uint8_t) (position & 0xff), (uint8_t) (position >> 8)};
           Wire.beginTransmission(I2C_ADDRESS);
           Wire.write(data, 3);
           Wire.endTransmission();
         }
       }
       server.send(204);
-    } else {
-      server.send(400);
     }
-  });
+ });
 
   server.onNotFound([]() {
     server.send(404);
   });
 
   server.begin();
-}
-
-void setupAwsIot() {
-  awsIotClient.setAWSDomain(AWS_ENDPOINT);
-  awsIotClient.setAWSRegion(AWS_REGION);
-  awsIotClient.setAWSKeyID(AWS_ACCESS_KEY_ID);
-  awsIotClient.setAWSSecretKey(AWS_SECRET_ACCESS_KEY);
-  awsIotClient.setUseSSL(true);
 }
 
 bool waitForI2CBytesAvailable(int waitForNumBytess) {
@@ -292,72 +279,54 @@ bool waitForI2CBytesAvailable(int waitForNumBytess) {
   return true;
 }
 
-bool awsIotConnect () {
-  if (mqttClient == NULL) {
-    mqttClient = new MQTT::Client<IPStack, Countdown, MQTT_MAX_PACKAGE_SIZE, MQTT_MAX_MESSAGE_HANDLERS>(mqttIpStack);
-  } else {
-    if (mqttClient->isConnected ()) {
-      mqttClient->disconnect ();
-    }
-    delete mqttClient;
-    mqttClient = new MQTT::Client<IPStack, Countdown, MQTT_MAX_PACKAGE_SIZE, MQTT_MAX_MESSAGE_HANDLERS>(mqttIpStack);
-  }
-
-  log("Connecting to AWS IOT WebSocket...");
-  if (mqttIpStack.connect((char *) AWS_ENDPOINT, WEBSOCKET_PORT) != 1) {
-    log("Unable to connect to AWS IOT WebSocket");
-    return false;
-  } else {
-    log("AWS IOT WebSocket connection established");
-  }
-
-  log("Connecting to AWS IOT MQTT broker...");
-  MQTTPacket_connectData data = MQTTPacket_connectData_initializer;
-  data.MQTTVersion = 3;
-  char* clientID = new char[23];
-  for (int i = 0; i < 22; ++i)
-    clientID[i]=(char) random(1, 256);
-  data.clientID.cstring = clientID;
-  if (mqttClient->connect(data) != 0) {
-    delete[] clientID;
-    log("Unable to connect to AWS IOT MQTT broker");
-    return false;
-  }
-  delete[] clientID;
-  log("AWS IOT MQTT broker connection established");
-  return true;
+void setupMqtt() {
+  client.setServer(MQTT_ENDPOINT, WEBSOCKET_PORT);
+  client.setCallback(mqttMessageReceived);
 }
 
-void awsIotSubscribeToShadowUpdates() {
-  if (mqttClient->subscribe(AWS_DELTA_TOPIC, MQTT::QOS0, awsIotMessageReceived) != 0) {
-    log("Unable to subscribe to MQTT topic");
-    return;
+void mqttConnect () {
+  log("Attempting MQTT connection...");
+  String clientId = "Smartkant-";
+  clientId += String(random(0xffff), HEX);
+  if (client.connect(clientId.c_str())) {
+    log("connected");
+    mqttSubscribeToShadowUpdates();
+  } else {
+    log("failed, rc=%d try again in 5 seconds", client.state());
+    delay(5000);
   }
+}
+
+void mqttSubscribeToShadowUpdates() {
+  client.subscribe(MQTT_DELTA_TOPIC);
   log("Subscribed to MQTT topic");
 }
 
-void awsIotMessageReceived(MQTT::MessageData& data)
+void mqttMessageReceived(char* topic, byte* payload, unsigned int length)
 {
-  MQTT::Message &message = data.message;
-  log("Message %s", message.payload);
-  StaticJsonBuffer<JSON_BUFFER_LENGTH> jsonBuffer;
-  JsonObject &json = jsonBuffer.parseObject((const char *) message.payload);
-  if (json.success()) {
-    if (json.containsKey("state")) {
-      JsonObject &state = json["state"];
-      if (state.containsKey("move")) {
-        const char *move = (const char *) state["move"];
-        if (strcmp("stop", move) == 0) {
-          tableStop();
-        } else if (strcmp("up", move) == 0) {
-          tableMoveUp();
-        } else if (strcmp("down", move) == 0) {
-          tableMoveDown();
-        } else if (strcmp("position", move) == 0) {
-          tableMoveToPosition((int) state["position"]);
-        } else if (strcmp("height", move) == 0) {
-          tableMoveToHeight((int) state["height"]);
-        }
+  log("Message %s", payload);
+  StaticJsonDocument<JSON_BUFFER_LENGTH> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  if (error) {
+    log("Deserialization of payload failed: %s", error.c_str());
+    return;
+  }
+
+  JsonObject json = doc.as<JsonObject>();
+  if(json.containsKey("state")) {
+    JsonObject state = json["state"];
+    if (state.containsKey("move")) {
+      const char *move = (const char *) state["move"];
+      if (strcmp("stop", move) == 0) {
+        tableStop();
+      } else if (strcmp("up", move) == 0) {
+        tableMoveUp();
+      } else if (strcmp("down", move) == 0) {
+        tableMoveDown();
+      } else if (strcmp("position", move) == 0) {
+        tableMoveToPosition((int) state["position"]);
+      } else if (strcmp("height", move) == 0) {
+        tableMoveToHeight((int) state["height"]);
       }
     }
   }
@@ -387,7 +356,7 @@ void tableMoveDown() {
 void tableMoveToPosition(int position) {
   if (position >= 1 && position <= NUM_POSITION_BUTTONS) {
     log("Table move to position %d", position);
-    uint8_t data[] = {I2C_CMD_MOVE_POSITION, 4 - position};
+    uint8_t data[] = {I2C_CMD_MOVE_POSITION, (uint8_t)(position - 1)};
     Wire.beginTransmission(I2C_ADDRESS);
     Wire.write(data, 2);
     Wire.endTransmission();

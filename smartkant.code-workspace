@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "smarkant-esp"
+		},
+		{
+			"path": "smarkant-arduino"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"functional": "cpp"
+		}
+	}
+}
