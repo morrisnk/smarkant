@@ -19,7 +19,7 @@ const int JSON_BUFFER_LENGTH = 512;
 const int NUM_POSITION_BUTTONS = 4;
 const uint16_t HEIGHT_MAX = 6000;
 const uint16_t HEIGHT_MIN = 500;
-const unsigned long WAIT_FOR_I2C_BYTES_TIMEOUT_MS = 1000;
+const unsigned long WAIT_FOR_I2C_BYTES_TIMEOUT_MS = 4000;
 const uint8_t I2C_ADDRESS = 0x10;
 const int WEBSOCKET_PORT = 1883;
 const int WEBSOCKET_BUFFER_SIZE = 1000;
@@ -47,6 +47,7 @@ MDNSResponder mdns;
 ESP8266WebServer server(80);
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
+uint16_t height;
 
 void log(const char *str, ...);
 void logProgress();
@@ -66,6 +67,8 @@ void tableMoveUp();
 void tableMoveDown();
 void tableMoveToPosition(int position);
 void tableMoveToHeight(int height);
+uint16_t readTableHeight();
+void checkState();
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
@@ -120,6 +123,8 @@ void setupOTA() {
   ArduinoOTA.begin();
 }
 
+unsigned int timer = millis() + 10000;
+
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
@@ -127,6 +132,12 @@ void loop() {
     mqttConnect();
   } else {
     client.loop();
+
+    // check state every 10 seconds
+    if(millis() > timer){
+      checkState();
+      timer = millis() + 10000;
+    }
   }
 }
 
@@ -328,6 +339,19 @@ void mqttMessageReceived(char* topic, byte* payload, unsigned int length)
       } else if (strcmp("height", move) == 0) {
         tableMoveToHeight((int) state["height"]);
       }
+    } else if (state.containsKey("height")) {
+      Wire.beginTransmission(I2C_ADDRESS);
+      Wire.write(I2C_CMD_READ_HEIGHT);
+      Wire.endTransmission();
+      Wire.requestFrom(I2C_ADDRESS, (uint8_t)2);
+      if (waitForI2CBytesAvailable(2)) {
+        uint16_t height = Wire.read() + (Wire.read() << 8);
+        StaticJsonDocument<JSON_BUFFER_LENGTH> json;
+        json["current_height"] = height;
+        String responseString;
+        serializeJson(json, responseString);
+        client.publish(MQTT_STATE_TOPIC, responseString.c_str());
+      }
     }
   }
 }
@@ -370,6 +394,55 @@ void tableMoveToHeight(int height) {
     Wire.beginTransmission(I2C_ADDRESS);
     Wire.write(data, 3);
     Wire.endTransmission();
+  }
+}
+
+uint16_t readTableHeight() {
+    uint8_t retryCount = 4;
+    bool success = false;
+    uint8_t err = 0;
+    while(!success && (retryCount)) {
+      Wire.begin();
+      Wire.beginTransmission(I2C_ADDRESS);
+      Wire.write(I2C_CMD_READ_HEIGHT);
+      err = Wire.endTransmission(false);
+      success = (err==0);
+      retryCount--;
+      if(!success){
+        delay(100);
+        Wire.clearWriteError();
+			  Wire.flush();
+       //wait a tiny bit for the 'other' master to complete
+      }
+    }
+    if(success) {
+      Wire.requestFrom(I2C_ADDRESS, (uint8_t)2);
+      if (waitForI2CBytesAvailable(2)) {
+        uint16_t height = Wire.read() + (Wire.read() << 8);
+        return height;
+      } else {
+        return 1;
+      }
+    } else {
+        StaticJsonDocument<JSON_BUFFER_LENGTH> json;
+        json["error"] = "Unable to send READ_HEIGHT request";
+        json["error_code"] = err;
+        String responseString;
+        serializeJson(json, responseString);
+        client.publish(MQTT_STATE_TOPIC, responseString.c_str());
+        return 0;
+    }
+}
+
+void checkState() {
+  uint16_t current_height = readTableHeight();
+  if(current_height != height && current_height > HEIGHT_MIN && current_height < HEIGHT_MAX) {
+    height = current_height;
+    StaticJsonDocument<JSON_BUFFER_LENGTH> json;
+    json["state"] = (height > 3250)?"STANDING":"SITTING";
+    String responseString;
+    serializeJson(json, responseString);
+    client.publish(MQTT_STATE_TOPIC, responseString.c_str());
   }
 }
 

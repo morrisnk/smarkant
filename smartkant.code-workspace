@@ -5,6 +5,10 @@
 		},
 		{
 			"path": "smarkant-arduino"
+		},
+		{
+			"name": "CalebPhotoSensor",
+			"path": "C:\\Users\\natha\\Dropbox\\development\\CalebPhotoSensor"
 		}
 	],
 	"settings": {
