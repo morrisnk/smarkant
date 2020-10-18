@@ -299,7 +299,7 @@ void mqttConnect () {
   log("Attempting MQTT connection...");
   String clientId = "Smartkant-";
   clientId += String(random(0xffff), HEX);
-  if (client.connect(clientId.c_str())) {
+  if (client.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
     log("connected");
     mqttSubscribeToShadowUpdates();
   } else {
